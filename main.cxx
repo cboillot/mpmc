@@ -246,10 +246,6 @@ int main() {
 
     auto run_suite = [&](const char* type_label, auto type_dummy) {
         using MsgType = decltype(type_dummy);
-        
-        double base_ms = compute_pure_compute_roofline_ms<MsgType>(TEST_ELEMENTS);
-        double base_mops = (TEST_ELEMENTS / (base_ms / 1000.0)) / 1'000'000.0;
-
         std::cout << "\n--- Testing Data Payload Type: " << type_label << " (" << sizeof(MsgType) << " Bytes) ---\n";
 
         for (auto const& topo : {std::make_pair(1,1), {1,4}, {2,2}, {4,4}, {4,8}, {1,20}, {16,16}, {24,24}}) {
@@ -258,8 +254,6 @@ int main() {
             double mops = (TEST_ELEMENTS / s) / 1'000'000.0;
             double gib_s = ((TEST_ELEMENTS * sizeof(MsgType)) / (1024.0*1024.0*1024.0)) / s;
             double cyc = (double)m.cycles_spent / TEST_ELEMENTS;
-            double efficiency = (mops / base_mops) * 100.0;
-
             global_total_messages += TEST_ELEMENTS; global_total_bytes += (TEST_ELEMENTS * sizeof(MsgType)); global_wall_time_ms += m.duration_ms; global_cpu_time_s += m.cpu_time_s;
 
             std::stringstream ss; ss << type_label << " (" << sizeof(MsgType) << "B), " << topo.first << " P -> " << topo.second << " C";
@@ -269,8 +263,7 @@ int main() {
             std::cout << std::setw(3) << topo.first << " P -> " << std::setw(2) << topo.second << " C | "
                       << std::fixed << std::setprecision(2) << std::setw(8) << mops << " Mops/s | "
                       << std::setw(7) << gib_s << " GiB/s | "
-                      << std::setw(7) << cyc << " cyc/msg | "
-                      << "Efficiency: " << std::setw(6) << efficiency << "%\n";
+                      << std::setw(7) << cyc << " cyc/msg\n";
         }
     };
 
