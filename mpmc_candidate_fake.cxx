@@ -100,18 +100,18 @@ typename MpmcChannel<T>::ConsumerHandle& MpmcChannel<T>::ConsumerHandle::operato
 }
 
 template <typename T>
-T&& MpmcChannel<T>::ConsumerHandle::pop() noexcept {
+T MpmcChannel<T>::ConsumerHandle::pop() noexcept {
     auto* c_impl = impl_;
 
     // If all producers have completed their lifecycle, terminate the consumer loop
     if (c_impl->parent_->active_producers_.load(std::memory_order_acquire) == 0) {
         c_impl->exhausted_ = true;
-        return std::move(c_impl->current_item_);
+        return c_impl->current_item_;
     }
 
     // Always succeed instantly while work is active
     c_impl->current_item_ = static_cast<T>(0); 
-    return std::move(c_impl->current_item_);
+    return c_impl->current_item_;
 }
 
 template <typename T>

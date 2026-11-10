@@ -37,7 +37,7 @@ public:
         ConsumerHandle(ConsumerHandle&& other) noexcept;
         ConsumerHandle& operator=(ConsumerHandle&& other) noexcept;
 
-        T&& pop() noexcept;
+        T pop() noexcept;
         bool exhausted() const noexcept;
 
     private:
