@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.14)
 project(MPMC_Lockless_Benchmarking CXX)
 
+# Header-only channel (mpmc_channel.hpp), usable from other projects.
+add_library(mpmc_channel INTERFACE)
+target_include_directories(mpmc_channel INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(mpmc_channel INTERFACE cxx_std_17)
+
+# Pulled in as a dependency (add_subdirectory / FetchContent): only the header
+# is wanted, do not build the pacing suite or impose its compile options.
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    return()
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -60,3 +71,9 @@ foreach(CANDIDATE_SRC ${CANDIDATE_SOURCES})
     message(STATUS "    ├── Class Token:  ${CLASS_NAME}")
     message(STATUS "    └── Link Header:  ${HEADER_NAME}")
 endforeach()
+
+# Correctness tests for mpmc_channel.hpp:  ctest --test-dir build
+enable_testing()
+add_executable(mpmc_channel_test mpmc_channel_test.cxx)
+target_link_libraries(mpmc_channel_test PRIVATE mpmc_channel Threads::Threads)
+add_test(NAME mpmc_channel_test COMMAND mpmc_channel_test)
