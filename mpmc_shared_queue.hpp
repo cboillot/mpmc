@@ -69,7 +69,7 @@ class shared_queue {
 
 public:
     static std::size_t default_max_threads() noexcept {
-        return std::max<std::size_t>(16, 2 * std::thread::hardware_concurrency());
+        return std::max<std::size_t>(64, 2 * std::thread::hardware_concurrency());
     }
 
     // Settings that suit a queue shared by threads that both push and pop.
@@ -122,18 +122,27 @@ public:
     }
 
     bool try_pop(T& out) {
-        return pop_slot().consumer.try_pop(out);
+        slot& s = pop_slot();
+        if (MPMC_CHANNEL_UNLIKELY(has_rescued_.load(std::memory_order_relaxed)) && take_rescued(out)) return true;
+        return s.consumer.try_pop(out);
     }
 
     // Blocks (spins, then yields) until an item arrives.
     void pop(T& out) {
-        pop_slot().consumer.pop(out);
+        pop_until(out, detail::never_stop{});
     }
 
     // Like pop(), but gives up (returns false) once stop() returns true.
     template <typename Stop>
     bool pop_until(T& out, Stop&& stop) {
-        return pop_slot().consumer.pop_until(out, stop);
+        slot& s = pop_slot();
+        for (;;) {
+            if (MPMC_CHANNEL_UNLIKELY(has_rescued_.load(std::memory_order_relaxed)) && take_rescued(out)) return true;
+            // also wake up when an exiting thread leaves items behind
+            auto interrupted = [&] { return has_rescued_.load(std::memory_order_relaxed) || stop(); };
+            if (s.consumer.pop_until(out, interrupted)) return true;
+            if (!has_rescued_.load(std::memory_order_relaxed)) return false;    // stop() said so
+        }
     }
 
     std::size_t capacity() const noexcept { return channel_.capacity(); }
@@ -231,21 +240,41 @@ private:
         return *e->where;
     }
 
-    // A thread is done with its slot (called with the registry locked).
+    // A thread is done with its slot (called with the registry locked, so it
+    // must not wait for anything).
     void release(slot& s) {
         if (s.consumer) {
-            // items it had stolen and not popped yet go back into the queue
-            s.consumer.drain_private([&s](T&& item) { s.producer.push(std::move(item)); });
+            // Items it had stolen and not popped yet go back into the queue,
+            // or, if the queue is full, aside for the next pop of any thread.
+            s.consumer.drain_private([this, &s](T&& item) {
+                if (s.producer.try_push(std::move(item))) return;
+                std::lock_guard<std::mutex> lock(rescued_mutex_);
+                rescued_.push_back(std::move(item));
+                has_rescued_.store(true, std::memory_order_release);
+            });
             s.consumer = typename channel_type::consumer{};     // its unread reservation stays in its ring
         }
         s.producer = typename channel_type::producer{};
         s.used.store(false, std::memory_order_release);
     }
 
+    MPMC_CHANNEL_NOINLINE bool take_rescued(T& out) {
+        std::lock_guard<std::mutex> lock(rescued_mutex_);
+        if (rescued_.empty()) return false;
+        out = std::move(rescued_.back());
+        rescued_.pop_back();
+        if (rescued_.empty()) has_rescued_.store(false, std::memory_order_release);
+        return true;
+    }
+
     channel_type channel_;                          // declared first: outlives the handles in the slots
     std::unique_ptr<slot[]> slots_;
     std::size_t nslots_;
     std::uint64_t id_;
+    // items exiting threads could not put back because the queue was full (rare)
+    alignas(detail::cache_line) std::atomic<bool> has_rescued_{false};
+    std::mutex rescued_mutex_;
+    std::vector<T> rescued_;
 };
 
 } // namespace mpmc

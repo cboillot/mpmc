@@ -495,7 +495,8 @@ private:
         publish_ = (o.publish_ == &o.sink_) ? &sink_ : o.publish_;
         ring_ = o.ring_; own_limit_ = o.own_limit_; owner_ = o.owner_; stash_ = o.stash_;
         victim_ = o.victim_; idle_ = o.idle_; steal_at_ = o.steal_at_; steal_gap_ = o.steal_gap_;
-        close_spins_ = o.close_spins_; starved_ = o.starved_; exhausted_ = o.exhausted_;
+        close_spins_ = o.close_spins_; starved_ = o.starved_; refills_ = o.refills_; patrol_ = o.patrol_;
+        exhausted_ = o.exhausted_;
         o.owner_ = nullptr; o.ring_ = nullptr; o.stash_ = nullptr; o.pos_ = o.limit_ = 0;
     }
 
@@ -663,6 +664,17 @@ private:
     template <typename Stop>
     MPMC_CHANNEL_NOINLINE bool refill(bool blocking, Stop& stop) {
         channel& ch = *owner_;
+
+        // Items sitting in a ring nobody pops from must not wait until we run
+        // dry, which may be never: look at one other ring every few refills
+        // and take what it holds if it has no consumer.
+        if ((++refills_ & 3) == 0 && ch.nrings_ > 1) {
+            if (++patrol_ >= ch.nrings_) patrol_ = 0;
+            ring& v = ch.rings_[patrol_];
+            bool contended = false;
+            if (&v != ring_ && !v.consumer_owned.load(std::memory_order_relaxed) && steal_from(v, 1, contended)) return true;
+        }
+
         for (;;) {
             if (reserve_own()) {
                 idle_ = 0;
@@ -744,6 +756,8 @@ private:
     std::uint32_t steal_gap_{4};
     std::uint32_t close_spins_{1};
     std::uint32_t starved_{0};                      // refills in a row that found our own ring empty
+    std::uint32_t refills_{0};
+    std::size_t patrol_{0};                         // next ring to check for abandoned items
     bool exhausted_{false};
     std::atomic<std::size_t> sink_{0};              // tail stand-in while popping from the stash
 };

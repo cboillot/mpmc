@@ -33,6 +33,7 @@ for a chunk of pushes) with:
 - work stealing: an idle consumer takes the items another ring's consumer has not reserved; rings without a
   consumer are drained by the others
 - waiting spins with a pause, then yields
+- consumers regularly collect items from rings nobody pops from, so nothing waits forever
 - producers prefer rings that have a consumer; a consumer whose ring is held by a producer that went quiet
   moves to a free ring
 
@@ -69,7 +70,7 @@ int value;
 if (queue.try_pop(value)) { /* ... */ }
 ```
 
-It allocates `max_threads` rings of `capacity` slots (default: twice the hardware threads, at least 16).
+It allocates `max_threads` rings of `capacity` slots (default: twice the hardware threads, at least 64).
 `try_pop` looks at the calling thread's own ring first and only now and then at the others, so it can
 return false while another ring still holds items; poll it again, or use `pop` / `pop_until`.
 Other CMake projects can `add_subdirectory` / `FetchContent` this repository and link `mpmc_channel`; the

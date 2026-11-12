@@ -290,6 +290,25 @@ void test_idle_producer() {
     CHECK(sum == 100000LL * 99999 / 2);
 }
 
+// Items in rings nobody pops from must be served even when the only consumer
+// never runs dry (it keeps re-pushing what it pops).
+void test_no_starvation() {
+    mpmc::channel_options o = mpmc::shared_queue<int>::default_options(1 << 12);
+    o.chunk = 64;
+    mpmc::shared_queue<int> q(o, 8);
+    const int items = 2048;
+    std::vector<int> served(items, 0);
+    std::thread seeder([&] { for (int i = 0; i < items; ++i) q.push(i); });     // spreads them over many rings
+    seeder.join();
+    int v = 0;
+    for (int n = 0; n < 200 * items; ++n) {
+        q.pop(v);
+        ++served[v];
+        q.push(v);
+    }
+    for (int i = 0; i < items; ++i) CHECK(served[i] > 0);
+}
+
 // shared_queue: threads come and go, every item arrives exactly once
 void test_shared_queue() {
     {
@@ -375,6 +394,7 @@ int main() {
     test_stalled_consumer(true);
     test_idle_producer();
     test_stress();
+    test_no_starvation();
     test_shared_queue();
     std::puts("mpmc_channel: all tests passed");
     return 0;
