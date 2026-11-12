@@ -80,6 +80,7 @@ public:
         o.max_batch = 256;
         o.steal_min = 64;
         o.steal_batch = 64;
+        o.balance_threshold = 2 * o.steal_batch;
         return o;
     }
 
@@ -105,7 +106,14 @@ public:
             registry.live.erase(id_);
         }
         slots_.reset();                             // the handles go before the channel
+#if defined(MPMC_CHANNEL_STATS)
+        channel_.print_stats(stderr, "mpmc::shared_queue");
+#endif
     }
+
+#if defined(MPMC_CHANNEL_STATS)
+    void print_stats(std::FILE* out = stderr) const { channel_.print_stats(out, "mpmc::shared_queue"); }
+#endif
 
     shared_queue(const shared_queue&) = delete;
     shared_queue& operator=(const shared_queue&) = delete;
@@ -230,6 +238,7 @@ private:
         if (pops && !e->pops) {
             // only a thread that pops takes a ring: a ring is where producers send items
             e->where->consumer = channel_.get_consumer();
+            e->where->producer.pair_with(&e->where->consumer);  // what this thread pushes stays with it
             e->pops = true;
         }
         cache& c = tls_cache_;
@@ -243,6 +252,7 @@ private:
     // A thread is done with its slot (called with the registry locked, so it
     // must not wait for anything).
     void release(slot& s) {
+        s.producer.pair_with(nullptr);
         if (s.consumer) {
             // Items it had stolen and not popped yet go back into the queue,
             // or, if the queue is full, aside for the next pop of any thread.

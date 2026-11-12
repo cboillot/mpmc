@@ -34,6 +34,11 @@ for a chunk of pushes) with:
   consumer are drained by the others
 - waiting spins with a pause, then yields
 - consumers regularly collect items from rings nobody pops from, so nothing waits forever
+- a producer can be paired with the consumer of the same thread (`producer::pair_with`) so that what a thread
+  pushes stays in its own ring, as in a work-stealing scheduler; `shared_queue` does it automatically
+- optional balancing (`balance_threshold`): a consumer takes a batch from another consumer's ring when that one
+  is clearly better supplied, so threads that re-push what they pop end up with equal shares; on in `shared_queue`
+- a producer gives its ring back at the end of every chunk, it never sits on one while idle between chunks
 - producers prefer rings that have a consumer; a consumer whose ring is held by a producer that went quiet
   moves to a free ring
 
@@ -54,6 +59,10 @@ while (consumer.pop(job)) { /* ... */ }   // false once all producers are gone a
 ```
 
 The rules on ordering, handle lifetime and stalled consumers are at the top of the header.
+
+Compile with `-DMPMC_CHANNEL_STATS` to count what the slow paths do (batches, steals, ring switches, waits...).
+`channel::print_stats()` prints the totals of the handles destroyed so far; a `shared_queue` prints them when it
+is destroyed. Nothing is counted on the hot paths, and without the macro nothing is compiled in.
 
 ## mpmc_shared_queue.hpp
 

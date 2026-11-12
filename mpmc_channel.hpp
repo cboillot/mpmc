@@ -67,6 +67,20 @@
     #define MPMC_CHANNEL_NOINLINE
 #endif
 
+// Define MPMC_CHANNEL_STATS to count what the slow paths do (reservations,
+// steals, ring switches, waits...).  The counters live in the handles and are
+// added up in the channel when a handle goes away; channel::print_stats()
+// prints the totals.  Nothing is counted on the hot paths, and nothing at all
+// is compiled in without the macro.
+#if defined(MPMC_CHANNEL_STATS)
+    #include <cstdio>
+    #define MPMC_CHANNEL_STAT(name) (++stats_[static_cast<std::size_t>(detail::stat::name)])
+    #define MPMC_CHANNEL_STAT_ADD(name, n) (stats_[static_cast<std::size_t>(detail::stat::name)] += (n))
+#else
+    #define MPMC_CHANNEL_STAT(name) ((void)0)
+    #define MPMC_CHANNEL_STAT_ADD(name, n) ((void)0)
+#endif
+
 namespace mpmc {
 
 struct channel_options {
@@ -92,6 +106,16 @@ struct channel_options {
     // what the pause actually yields) to let a batch build up.  0 disables it.
     std::size_t close_threshold = 1024;
     std::uint32_t close_spins = 256;
+    // A producer paired with a consumer (producer::pair_with) pushes into
+    // that consumer's ring for as long as the ring holds fewer items than
+    // this; beyond that its chunks go to the other rings.  0 = capacity / 2.
+    std::size_t home_high_water = 0;
+    // When not 0, a consumer that finds another consumer's ring holding this
+    // many more unreserved items than its own takes a batch of them (checked
+    // on one ring every few refills).  It evens out the supplies of threads
+    // that re-push what they pop, which otherwise never change: such a thread
+    // never runs dry, so it never steals.  0 = off.
+    std::size_t balance_threshold = 0;
 };
 
 namespace detail {
@@ -113,6 +137,51 @@ namespace detail {
     }
 
     struct never_stop { bool operator()() const noexcept { return false; } };
+
+#if defined(MPMC_CHANNEL_STATS)
+    enum class stat : std::size_t {
+        // consumer
+        consumers,          // consumer handles that reported
+        refills,            // times a consumer ran out of its batch
+        own_batches,        // batches reserved from its own ring
+        own_items,          // items in those batches
+        own_empty,          // looks at its own ring that found nothing
+        thefts_noticed,     // reservations that found part of the ring stolen
+        close_pauses,       // pauses spent letting a batch build up
+        steal_tries,        // attempts to steal from a ring
+        steal_contended,    // attempts lost to somebody else
+        steals,             // successful steals
+        stolen_items,       // items moved by them
+        steals_orphan,      // ... of which from a ring without consumer
+        steals_patrol,      // ... of which by the periodic check, not for lack of work
+        steals_balance,     // ... of which to even out the rings of two consumers
+        migrations,         // moves to another ring
+        idle_rounds,        // waits with nothing to pop
+        yields,             // ... of which gave the cpu away
+        // producer
+        producers,          // producer handles that reported
+        acquires,           // times a producer ran out of chunk or room
+        room_refreshes,     // ... solved by re-reading the consumer's position
+        chunk_ends,         // ... because the chunk was complete
+        ring_full,          // ... because the ring was full
+        ring_switches,      // rings taken
+        home_rings_taken,   // ... of which the ring of the paired consumer
+        orphan_rings_taken, // ... of which had no consumer
+        busy_skips,         // rings passed over because another producer held them
+        full_skips,         // rings passed over because they were full
+        producer_waits,     // sweeps over all rings that found none
+        count_
+    };
+
+    constexpr char const* stat_names[] = {
+        "consumers", "refills", "own_batches", "own_items", "own_empty", "thefts_noticed", "close_pauses",
+        "steal_tries", "steal_contended", "steals", "stolen_items", "steals_orphan", "steals_patrol", "steals_balance",
+        "migrations", "idle_rounds", "yields",
+        "producers", "acquires", "room_refreshes", "chunk_ends", "ring_full", "ring_switches",
+        "home_rings_taken", "orphan_rings_taken", "busy_skips", "full_skips", "producer_waits"};
+
+    using stat_array = std::uint64_t[static_cast<std::size_t>(stat::count_)];
+#endif
 }
 
 template <typename T>
@@ -170,6 +239,7 @@ public:
         opts_.steal_batch = std::max<std::size_t>(1, opts_.steal_batch);
         if (opts_.steal_min == 0) opts_.steal_min = std::max<std::size_t>(1, opts_.capacity / 8);
         opts_.close_spins = std::max<std::uint32_t>(1, opts_.close_spins);
+        if (opts_.home_high_water == 0) opts_.home_high_water = std::max<std::size_t>(1, opts_.capacity / 2);
 
         rings_.reset(new ring[nrings_]);
         const std::size_t bytes = opts_.capacity * sizeof(T);
@@ -234,6 +304,29 @@ public:
     std::size_t rings() const noexcept { return nrings_; }
     const channel_options& options() const noexcept { return opts_; }
 
+#if defined(MPMC_CHANNEL_STATS)
+    // Totals of the handles destroyed so far, plus what the rings hold now.
+    void print_stats(std::FILE* out = stderr, char const* label = "mpmc") const {
+        std::fprintf(out, "[%s stats]", label);
+        for (std::size_t i = 0; i < static_cast<std::size_t>(detail::stat::count_); ++i) {
+            std::fprintf(out, " %s=%llu", detail::stat_names[i],
+                         static_cast<unsigned long long>(totals_[i].load(std::memory_order_relaxed)));
+        }
+        std::size_t used = 0, owned = 0, held = 0, most = 0, items = 0;
+        for (std::size_t i = 0; i < nrings_; ++i) {
+            const ring& r = rings_[i];
+            const std::size_t fill = r.head.load(std::memory_order_relaxed) - r.tail.load(std::memory_order_relaxed);
+            used += (r.head.load(std::memory_order_relaxed) != 0);
+            owned += r.consumer_owned.load(std::memory_order_relaxed);
+            held += r.producer_owned.load(std::memory_order_relaxed);
+            most = std::max(most, fill);
+            items += fill;
+        }
+        std::fprintf(out, " | rings=%zu ever_used=%zu with_consumer=%zu producer_held=%zu fill_total=%zu fill_max=%zu\n",
+                     nrings_, used, owned, held, items, most);
+    }
+#endif
+
 private:
     static channel_options with_capacity(std::size_t capacity) noexcept {
         channel_options o;
@@ -254,6 +347,15 @@ private:
     alignas(detail::cache_line) std::atomic<std::size_t> unfinished_;
     // producer handles handed out so far (cold: only touched by get_producer / close)
     alignas(detail::cache_line) std::atomic<std::size_t> created_;
+
+#if defined(MPMC_CHANNEL_STATS)
+    void add_stats(const detail::stat_array& local) noexcept {
+        for (std::size_t i = 0; i < static_cast<std::size_t>(detail::stat::count_); ++i) {
+            if (local[i]) totals_[i].fetch_add(local[i], std::memory_order_relaxed);
+        }
+    }
+    std::atomic<std::uint64_t> totals_[static_cast<std::size_t>(detail::stat::count_)] = {};
+#endif
 };
 
 //==============================================================================
@@ -276,7 +378,10 @@ public:
     // Blocks (spins, then yields) while every ring is full or taken.
     template <typename U>
     void push(U&& value) {
-        if (MPMC_CHANNEL_UNLIKELY(pos_ == limit_)) acquire(true);
+        if (MPMC_CHANNEL_UNLIKELY(pos_ == limit_)) {
+            push_slow(std::forward<U>(value), true);
+            return;
+        }
         ::new (static_cast<void*>(data_ + (pos_ & mask_))) T(std::forward<U>(value));
         head_->store(++pos_, std::memory_order_release);
     }
@@ -284,7 +389,7 @@ public:
     // Returns false, without waiting, when no ring can take the item right now.
     template <typename U>
     bool try_push(U&& value) {
-        if (MPMC_CHANNEL_UNLIKELY(pos_ == limit_) && !acquire(false)) return false;
+        if (MPMC_CHANNEL_UNLIKELY(pos_ == limit_)) return push_slow(std::forward<U>(value), false);
         ::new (static_cast<void*>(data_ + (pos_ & mask_))) T(std::forward<U>(value));
         head_->store(++pos_, std::memory_order_release);
         return true;
@@ -296,6 +401,20 @@ public:
         if (ring_) drop_ring();
     }
 
+    // For a thread that both pushes and pops: make this producer push into
+    // the ring `mine` pops from (while it holds fewer than home_high_water
+    // items) instead of taking the rings in turn.
+    //
+    // Without it, threads that re-push what they pop feed each other's rings
+    // in a fixed pattern, and the items end up piled in the ring of the
+    // slowest thread while the others starve.  With it every thread keeps its
+    // own supply, as in a work-stealing scheduler, and the other threads only
+    // come for it when they run dry.
+    //
+    // `mine` must be used by the same thread as this producer and must stay
+    // at the same address; pass nullptr to undo.
+    void pair_with(const consumer* mine) noexcept { partner_ = mine; }
+
 private:
     friend class channel<T>;
 
@@ -304,12 +423,20 @@ private:
     void steal_state(producer& o) noexcept {
         pos_ = o.pos_; limit_ = o.limit_; data_ = o.data_; mask_ = o.mask_; head_ = o.head_;
         ring_ = o.ring_; chunk_end_ = o.chunk_end_; owner_ = o.owner_; idx_ = o.idx_;
-        o.owner_ = nullptr; o.ring_ = nullptr; o.pos_ = o.limit_ = 0;
+        partner_ = o.partner_;
+        o.owner_ = nullptr; o.ring_ = nullptr; o.pos_ = o.limit_ = 0; o.partner_ = nullptr;
+#if defined(MPMC_CHANNEL_STATS)
+        for (std::size_t i = 0; i < static_cast<std::size_t>(detail::stat::count_); ++i) { stats_[i] = o.stats_[i]; o.stats_[i] = 0; }
+#endif
     }
 
     void reset() noexcept {
         if (!owner_) return;
         if (ring_) drop_ring();
+#if defined(MPMC_CHANNEL_STATS)
+        MPMC_CHANNEL_STAT(producers);
+        owner_->add_stats(stats_);
+#endif
         owner_->unfinished_.fetch_sub(1, std::memory_order_release);
         owner_ = nullptr;
     }
@@ -328,23 +455,64 @@ private:
         head_ = &r.head;
         pos_ = pos;
         chunk_end_ = pos + owner_->opts_.chunk;
-        limit_ = std::min(chunk_end_, tail + r.capacity);
+        // the last item of a chunk goes through the slow path (see push_slow)
+        limit_ = std::min(chunk_end_ - 1, tail + r.capacity);
     }
 
-    // Slow path: called when the chunk is used up or the ring looks full.
-    MPMC_CHANNEL_NOINLINE bool acquire(bool blocking) noexcept {
+    // Slow path of push: the hot path stopped because the ring looks full, we
+    // hold no ring, or this is the last item of the chunk.  That last item is
+    // pushed from here so that the ring can be given back right away: a
+    // producer never sits on a ring between two chunks.
+    template <typename U>
+    MPMC_CHANNEL_NOINLINE bool push_slow(U&& value, bool blocking) {
+        if (!acquire(blocking)) return false;
+        ::new (static_cast<void*>(data_ + (pos_ & mask_))) T(std::forward<U>(value));
+        head_->store(++pos_, std::memory_order_release);
+        if (pos_ == chunk_end_) {
+            MPMC_CHANNEL_STAT(chunk_ends);
+            drop_ring();
+        }
+        return true;
+    }
+
+    // Make sure we hold a ring with room for one more item at pos_ (and with
+    // pos_ inside the chunk).
+    bool acquire(bool blocking) noexcept {
         channel& ch = *owner_;
+        MPMC_CHANNEL_STAT(acquires);
         if (ring_) {
-            if (pos_ != chunk_end_) {
-                // out of room, not out of chunk: the consumer may have moved on
-                const std::size_t tail = ring_->tail.load(std::memory_order_acquire);
+            std::size_t tail = ring_->cached_tail;
+            if (pos_ - tail >= ring_->capacity) {
+                // out of room: the consumer may have moved on
+                tail = ring_->tail.load(std::memory_order_acquire);
                 ring_->cached_tail = tail;
-                if (pos_ - tail < ring_->capacity) {
-                    limit_ = std::min(chunk_end_, tail + ring_->capacity);
+#if defined(MPMC_CHANNEL_STATS)
+                if (pos_ - tail < ring_->capacity) MPMC_CHANNEL_STAT(room_refreshes);
+#endif
+            }
+            if (pos_ - tail < ring_->capacity) {
+                limit_ = std::min(chunk_end_ - 1, tail + ring_->capacity);
+                return true;
+            }
+            MPMC_CHANNEL_STAT(ring_full);
+            drop_ring();
+        }
+        if (partner_ && partner_->owner_ == owner_) {
+            // our own thread pops from this ring: keep our supply at home
+            ring& r = *partner_->ring_;
+            if (!r.producer_owned.load(std::memory_order_relaxed) &&
+                !r.producer_owned.exchange(true, std::memory_order_acquire)) {
+                const std::size_t pos = r.head.load(std::memory_order_relaxed);
+                const std::size_t tail = r.tail.load(std::memory_order_acquire);
+                r.cached_tail = tail;
+                if (pos - tail < ch.opts_.home_high_water && pos - tail < r.capacity) {
+                    adopt(r, pos, tail);
+                    MPMC_CHANNEL_STAT(ring_switches);
+                    MPMC_CHANNEL_STAT(home_rings_taken);
                     return true;
                 }
+                r.producer_owned.store(false, std::memory_order_release);
             }
-            drop_ring();
         }
         for (std::uint32_t round = 1;; ++round) {
             // First choice: a ring somebody is popping from.  Rings without a
@@ -353,6 +521,9 @@ private:
             for (std::size_t n = 0, total = 2 * ch.nrings_; n < total; ++n) {
                 ring& r = ch.rings_[idx_];
                 const bool wanted = n >= ch.nrings_ || r.consumer_owned.load(std::memory_order_relaxed);
+#if defined(MPMC_CHANNEL_STATS)
+                if (wanted && r.producer_owned.load(std::memory_order_relaxed)) MPMC_CHANNEL_STAT(busy_skips);
+#endif
                 if (wanted && !r.producer_owned.load(std::memory_order_relaxed) &&
                     !r.producer_owned.exchange(true, std::memory_order_acquire)) {
                     const std::size_t pos = r.head.load(std::memory_order_relaxed);
@@ -363,12 +534,18 @@ private:
                     }
                     if (pos - tail < r.capacity) {
                         adopt(r, pos, tail);
+                        MPMC_CHANNEL_STAT(ring_switches);
+#if defined(MPMC_CHANNEL_STATS)
+                        if (!r.consumer_owned.load(std::memory_order_relaxed)) MPMC_CHANNEL_STAT(orphan_rings_taken);
+#endif
                         return true;
                     }
+                    MPMC_CHANNEL_STAT(full_skips);
                     r.producer_owned.store(false, std::memory_order_release);
                 }
                 if (++idx_ == ch.nrings_) idx_ = 0;
             }
+            MPMC_CHANNEL_STAT(producer_waits);
             if (!blocking) return false;
             detail::idle_wait(round);
         }
@@ -385,6 +562,10 @@ private:
     std::size_t chunk_end_{0};
     channel* owner_{nullptr};
     std::size_t idx_{0};
+    const consumer* partner_{nullptr};
+#if defined(MPMC_CHANNEL_STATS)
+    detail::stat_array stats_ = {};
+#endif
 };
 
 //==============================================================================
@@ -497,6 +678,9 @@ private:
         victim_ = o.victim_; idle_ = o.idle_; steal_at_ = o.steal_at_; steal_gap_ = o.steal_gap_;
         close_spins_ = o.close_spins_; starved_ = o.starved_; refills_ = o.refills_; patrol_ = o.patrol_;
         exhausted_ = o.exhausted_;
+#if defined(MPMC_CHANNEL_STATS)
+        for (std::size_t i = 0; i < static_cast<std::size_t>(detail::stat::count_); ++i) { stats_[i] = o.stats_[i]; o.stats_[i] = 0; }
+#endif
         o.owner_ = nullptr; o.ring_ = nullptr; o.stash_ = nullptr; o.pos_ = o.limit_ = 0;
     }
 
@@ -510,6 +694,10 @@ private:
         detach();
         if (stash_) ::operator delete(stash_, std::align_val_t{std::max(alignof(T), detail::cache_line)});
         stash_ = nullptr;
+#if defined(MPMC_CHANNEL_STATS)
+        MPMC_CHANNEL_STAT(consumers);
+        owner_->add_stats(stats_);
+#endif
         owner_ = nullptr;
     }
 
@@ -528,6 +716,7 @@ private:
             // streaming adds many items per pause; one that trickles does not,
             // and then waiting would only add latency.
             const std::size_t before = head;
+            MPMC_CHANNEL_STAT_ADD(close_pauses, close_spins_);
             for (std::uint32_t i = 0; i < close_spins_; ++i) MPMC_CHANNEL_RELAX();
             head = r.head.load(std::memory_order_acquire);
             if (head - before < close_spins_) {
@@ -547,8 +736,11 @@ private:
                 publish_ = &r.tail;
                 pos_ = base;
                 limit_ = own_limit_ = base + n;
+                MPMC_CHANNEL_STAT(own_batches);
+                MPMC_CHANNEL_STAT_ADD(own_items, n);
                 return true;
             }
+            MPMC_CHANNEL_STAT(thefts_noticed);
             // Thieves took [base, expected).  A thief holds the steal lock from
             // before its claim until it has moved its items out, so once the
             // lock is seen free those slots may go back to the producer.
@@ -594,8 +786,10 @@ private:
             stash_ = static_cast<T*>(::operator new(o.steal_batch * sizeof(T),
                                                     std::align_val_t{std::max(alignof(T), detail::cache_line)}));
         }
+        MPMC_CHANNEL_STAT(steal_tries);
         if (v.steal_lock.load(std::memory_order_relaxed) || v.steal_lock.exchange(true, std::memory_order_seq_cst)) {
             contended = true;
+            MPMC_CHANNEL_STAT(steal_contended);
             return false;
         }
 
@@ -611,6 +805,9 @@ private:
                 v.tail.store(from + n, std::memory_order_release);
                 v.unlock_steal();
                 use_stash(n);
+                MPMC_CHANNEL_STAT(steals);
+                MPMC_CHANNEL_STAT(steals_orphan);
+                MPMC_CHANNEL_STAT_ADD(stolen_items, n);
                 return true;
             }
         }
@@ -622,7 +819,10 @@ private:
         if (avail == 0 || avail < min_backlog ||
             !v.claim.compare_exchange_strong(claim, claim + n, std::memory_order_seq_cst)) {
             v.unlock_steal();
-            if (avail != 0 && avail >= min_backlog) contended = true;     // lost the race for the items
+            if (avail != 0 && avail >= min_backlog) {                   // lost the race for the items
+                contended = true;
+                MPMC_CHANNEL_STAT(steal_contended);
+            }
             return false;
         }
         move_out(v, claim, n, stash_);
@@ -639,6 +839,11 @@ private:
         }
         v.unlock_steal();
         use_stash(n);
+        MPMC_CHANNEL_STAT(steals);
+        MPMC_CHANNEL_STAT_ADD(stolen_items, n);
+#if defined(MPMC_CHANNEL_STATS)
+        if (!v.consumer_owned.load(std::memory_order_relaxed)) MPMC_CHANNEL_STAT(steals_orphan);
+#endif
         return true;
     }
 
@@ -664,15 +869,31 @@ private:
     template <typename Stop>
     MPMC_CHANNEL_NOINLINE bool refill(bool blocking, Stop& stop) {
         channel& ch = *owner_;
+        MPMC_CHANNEL_STAT(refills);
 
         // Items sitting in a ring nobody pops from must not wait until we run
         // dry, which may be never: look at one other ring every few refills
-        // and take what it holds if it has no consumer.
+        // and take what it holds if it has no consumer.  The same visit evens
+        // out our supply with another consumer's (balance_threshold).
         if ((++refills_ & 3) == 0 && ch.nrings_ > 1) {
             if (++patrol_ >= ch.nrings_) patrol_ = 0;
             ring& v = ch.rings_[patrol_];
             bool contended = false;
-            if (&v != ring_ && !v.consumer_owned.load(std::memory_order_relaxed) && steal_from(v, 1, contended)) return true;
+            if (&v != ring_) {
+                if (!v.consumer_owned.load(std::memory_order_relaxed)) {
+                    if (steal_from(v, 1, contended)) {
+                        MPMC_CHANNEL_STAT(steals_patrol);
+                        return true;
+                    }
+                } else if (ch.opts_.balance_threshold != 0) {
+                    // another consumer's ring: take a batch if it is clearly better off than ours
+                    const std::size_t mine = ring_->head.load(std::memory_order_relaxed) - own_limit_;
+                    if (steal_from(v, mine + ch.opts_.balance_threshold, contended)) {
+                        MPMC_CHANNEL_STAT(steals_balance);
+                        return true;
+                    }
+                }
+            }
         }
 
         for (;;) {
@@ -683,15 +904,19 @@ private:
                 return true;
             }
             ++idle_;
+            MPMC_CHANNEL_STAT(own_empty);
 
             // Our ring stays empty while a producer sits on it without
             // pushing (it went quiet in the middle of a chunk, so no other
             // producer can use the ring): move to a ring nobody pops from.
             if (++starved_ >= 64 && ch.nrings_ > 1) {
                 starved_ = 0;
-                if (ring_->producer_owned.load(std::memory_order_relaxed) && migrate() && pos_ != limit_) {
-                    idle_ = 0;
-                    return true;
+                if (ring_->producer_owned.load(std::memory_order_relaxed) && migrate()) {
+                    MPMC_CHANNEL_STAT(migrations);
+                    if (pos_ != limit_) {
+                        idle_ = 0;
+                        return true;
+                    }
                 }
             }
 
@@ -735,6 +960,10 @@ private:
             }
 
             if (!blocking || stop()) return false;
+            MPMC_CHANNEL_STAT(idle_rounds);
+#if defined(MPMC_CHANNEL_STATS)
+            if (idle_ > 64) MPMC_CHANNEL_STAT(yields);
+#endif
             detail::idle_wait(idle_);
         }
     }
@@ -760,6 +989,9 @@ private:
     std::size_t patrol_{0};                         // next ring to check for abandoned items
     bool exhausted_{false};
     std::atomic<std::size_t> sink_{0};              // tail stand-in while popping from the stash
+#if defined(MPMC_CHANNEL_STATS)
+    detail::stat_array stats_ = {};
+#endif
 };
 
 } // namespace mpmc

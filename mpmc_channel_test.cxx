@@ -2,6 +2,7 @@
 #include "mpmc_channel.hpp"
 #include "mpmc_shared_queue.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -309,6 +310,68 @@ void test_no_starvation() {
     for (int i = 0; i < items; ++i) CHECK(served[i] > 0);
 }
 
+// A producer paired with a consumer keeps its items in that consumer's ring:
+// with one thread they come back in order, however small the chunk is.
+void test_pairing() {
+    mpmc::channel_options o;
+    o.capacity = 256;
+    o.chunk = 4;                                    // unpaired, this would spread them over all the rings
+    mpmc::channel<int> ch(2, 4, o);
+    auto c = ch.get_consumer();
+    auto p = ch.get_producer();
+    p.pair_with(&c);
+    int v = -1;
+    for (int lap = 0; lap < 50; ++lap) {
+        for (int i = 0; i < 100; ++i) p.push(lap * 100 + i);
+        for (int i = 0; i < 100; ++i) { CHECK(c.try_pop(v)); CHECK(v == lap * 100 + i); }
+    }
+    // above the high-water mark the chunks go elsewhere, and still arrive
+    o.home_high_water = 8;
+    mpmc::channel<int> small(2, 4, o);
+    auto c2 = small.get_consumer();
+    auto p2 = small.get_producer();
+    p2.pair_with(&c2);
+    long long sum = 0;
+    for (int i = 0; i < 200; ++i) p2.push(i);
+    p2.pair_with(nullptr);
+    p2 = {};
+    small.close();
+    while (c2.pop(v)) sum += v;
+    CHECK(sum == 200LL * 199 / 2);
+}
+
+// Two "threads" that re-push what they pop, one starting with everything and
+// one with nothing.  Neither ever runs dry once it holds a few items, so only
+// the balancing brings their supplies level and gives every item its share.
+void test_balancing() {
+    const int items = 4000;
+    mpmc::channel_options o = mpmc::shared_queue<int>::default_options(1 << 13);
+    mpmc::channel<int> ch(2, 2, o);
+    auto rich_c = ch.get_consumer();
+    auto rich_p = ch.get_producer();
+    rich_p.pair_with(&rich_c);
+    auto poor_c = ch.get_consumer();
+    auto poor_p = ch.get_producer();
+    poor_p.pair_with(&poor_c);
+    for (int i = 0; i < items; ++i) rich_p.push(i);
+
+    std::vector<int> served(items, 0);
+    long long rich_pops = 0, poor_pops = 0;
+    int v = 0;
+    for (int n = 0; n < 400 * items; ++n) {         // the two take turns
+        const bool count = n >= 200 * items;        // measure once things have settled
+        if (rich_c.try_pop(v)) { rich_p.push(v); if (count) { ++served[v]; ++rich_pops; } }
+        if (poor_c.try_pop(v)) { poor_p.push(v); if (count) { ++served[v]; ++poor_pops; } }
+    }
+    CHECK(poor_pops > rich_pops * 9 / 10);          // the poor one works as much as the rich one
+    int least = served[0], most = served[0];
+    for (int x : served) { least = std::min(least, x); most = std::max(most, x); }
+    CHECK(least > 0);
+    CHECK(most < 2 * least);                        // and no item is served twice as often as another
+    rich_p.pair_with(nullptr);
+    poor_p.pair_with(nullptr);
+}
+
 // shared_queue: threads come and go, every item arrives exactly once
 void test_shared_queue() {
     {
@@ -394,6 +457,8 @@ int main() {
     test_stalled_consumer(true);
     test_idle_producer();
     test_stress();
+    test_pairing();
+    test_balancing();
     test_no_starvation();
     test_shared_queue();
     std::puts("mpmc_channel: all tests passed");
