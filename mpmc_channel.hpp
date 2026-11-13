@@ -138,6 +138,16 @@ namespace detail {
 
     struct never_stop { bool operator()() const noexcept { return false; } };
 
+    inline int count_trailing_zeros(std::uint64_t v) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_ctzll(v);
+#else
+        int n = 0;
+        while ((v & 1) == 0) { v >>= 1; ++n; }
+        return n;
+#endif
+    }
+
 #if defined(MPMC_CHANNEL_STATS)
     enum class stat : std::size_t {
         // consumer
@@ -217,6 +227,12 @@ class channel {
         std::size_t stolen_lo{0};                   // guarded by steal_lock
         std::size_t stolen_hi{0};
 
+        // What the owning consumer saw left over the last time it reserved a
+        // batch.  Other consumers read this, not head/claim, to judge whether
+        // the ring is better supplied than theirs: it changes once per batch,
+        // so looking at it does not slow the owner down.
+        alignas(detail::cache_line) std::atomic<std::size_t> supply{0};
+
         void lock_steal() noexcept {
             while (steal_lock.exchange(true, std::memory_order_seq_cst)) MPMC_CHANNEL_RELAX();
         }
@@ -242,6 +258,9 @@ public:
         if (opts_.home_high_water == 0) opts_.home_high_water = std::max<std::size_t>(1, opts_.capacity / 2);
 
         rings_.reset(new ring[nrings_]);
+        const std::size_t words = (nrings_ + 63) / 64;
+        attended_.reset(new std::atomic<std::uint64_t>[words]());
+        abandoned_.reset(new std::atomic<std::uint64_t>[words]());
         const std::size_t bytes = opts_.capacity * sizeof(T);
         const std::align_val_t align{std::max(alignof(T), detail::cache_line)};
         for (std::size_t i = 0; i < nrings_; ++i) {
@@ -339,8 +358,40 @@ private:
         for (; from != to; ++from) r.data[from & r.mask].~T();
     }
 
+    // One bit per ring, in two maps.  They let a consumer go straight to the
+    // rings that matter instead of visiting all of them in turn, which with
+    // many more rings than threads took too long to be of any use.
+    //   attended:  the ring has a consumer
+    //   abandoned: the ring has no consumer and may hold items
+    using ring_map = std::unique_ptr<std::atomic<std::uint64_t>[]>;
+
+    std::size_t index_of(const ring& r) const noexcept { return static_cast<std::size_t>(&r - rings_.get()); }
+
+    static void mark(ring_map& map, std::size_t i) noexcept {
+        map[i / 64].fetch_or(std::uint64_t{1} << (i % 64), std::memory_order_seq_cst);
+    }
+    static void unmark(ring_map& map, std::size_t i) noexcept {
+        map[i / 64].fetch_and(~(std::uint64_t{1} << (i % 64)), std::memory_order_seq_cst);
+    }
+    // first marked ring after `from`, wrapping around; nrings_ if there is none
+    std::size_t next_marked(const ring_map& map, std::size_t from) const noexcept {
+        const std::size_t words = (nrings_ + 63) / 64;
+        std::size_t start = from + 1;
+        if (start >= nrings_) start = 0;
+        std::size_t w = start / 64;
+        std::uint64_t bits = map[w].load(std::memory_order_relaxed) & (~std::uint64_t{0} << (start % 64));
+        for (std::size_t n = 0; n <= words; ++n) {
+            if (bits != 0) return w * 64 + static_cast<std::size_t>(detail::count_trailing_zeros(bits));
+            if (++w == words) w = 0;
+            bits = map[w].load(std::memory_order_relaxed);
+        }
+        return nrings_;
+    }
+
     channel_options opts_;
     std::unique_ptr<ring[]> rings_;
+    ring_map attended_;
+    ring_map abandoned_;
     std::size_t nrings_;
     std::size_t max_producers_;
     // producers that have not finished yet, including the ones not created yet
@@ -535,9 +586,11 @@ private:
                     if (pos - tail < r.capacity) {
                         adopt(r, pos, tail);
                         MPMC_CHANNEL_STAT(ring_switches);
-#if defined(MPMC_CHANNEL_STATS)
-                        if (!r.consumer_owned.load(std::memory_order_relaxed)) MPMC_CHANNEL_STAT(orphan_rings_taken);
-#endif
+                        if (!r.consumer_owned.load(std::memory_order_seq_cst)) {
+                            // what we push here has to be fetched by somebody: say so
+                            channel::mark(ch.abandoned_, ch.index_of(r));
+                            MPMC_CHANNEL_STAT(orphan_rings_taken);
+                        }
                         return true;
                     }
                     MPMC_CHANNEL_STAT(full_skips);
@@ -650,6 +703,7 @@ private:
         r.parked_pos.store(limit_, std::memory_order_relaxed);
         r.unlock_steal();
         starved_ = 0;
+        channel::mark(owner_->attended_, owner_->index_of(r));
     }
 
     // Give ring_ up.  The unread part of our reservation stays parked in the
@@ -662,6 +716,8 @@ private:
         r.parked_limit.store(own_run ? limit_ : own_limit_, std::memory_order_relaxed);
         r.consumer_owned.store(false, std::memory_order_seq_cst);
         r.unlock_steal();
+        channel::unmark(owner_->attended_, owner_->index_of(r));
+        channel::mark(owner_->abandoned_, owner_->index_of(r));     // whatever it still holds is up for grabs
     }
 
     void take(T& out) noexcept(std::is_nothrow_move_assignable<T>::value) {
@@ -707,7 +763,10 @@ private:
         const channel_options& o = owner_->opts_;
         std::size_t head = r.head.load(std::memory_order_acquire);
         std::size_t base = own_limit_;
-        if (head == base) return false;
+        if (head == base) {
+            if (r.supply.load(std::memory_order_relaxed) != 0) r.supply.store(0, std::memory_order_relaxed);
+            return false;
+        }
 
         if (head - base < o.close_threshold) {
             // Following the producer too closely: every refill would bounce
@@ -736,6 +795,7 @@ private:
                 publish_ = &r.tail;
                 pos_ = base;
                 limit_ = own_limit_ = base + n;
+                r.supply.store(avail - n, std::memory_order_relaxed);
                 MPMC_CHANNEL_STAT(own_batches);
                 MPMC_CHANNEL_STAT_ADD(own_items, n);
                 return true;
@@ -847,6 +907,41 @@ private:
         return true;
     }
 
+    // Take a batch from a ring marked as abandoned, if there is one; rings
+    // that turn out to be empty or attended are unmarked on the way.
+    bool collect_abandoned() {
+        channel& ch = *owner_;
+        const std::size_t words = (ch.nrings_ + 63) / 64;
+        for (std::size_t w = 0; w < words; ++w) {
+            std::uint64_t bits = ch.abandoned_[w].load(std::memory_order_relaxed);
+            for (; bits != 0; bits &= bits - 1) {
+                const std::size_t i = w * 64 + static_cast<std::size_t>(detail::count_trailing_zeros(bits));
+                ring& v = ch.rings_[i];
+                if (v.consumer_owned.load(std::memory_order_seq_cst)) {
+                    // it has a consumer (maybe us): not abandoned.  Re-check
+                    // afterwards in case that consumer was just leaving.
+                    channel::unmark(ch.abandoned_, i);
+                    if (!v.consumer_owned.load(std::memory_order_seq_cst)) channel::mark(ch.abandoned_, i);
+                    continue;
+                }
+                bool contended = false;
+                if (steal_from(v, 1, contended)) return true;
+                if (contended || v.producer_owned.load(std::memory_order_seq_cst)) continue;   // more may come
+                // Empty, and no producer on it.  Unmark, then look again: a
+                // producer that arrived meanwhile either still holds the
+                // ring or has left items behind.
+                channel::unmark(ch.abandoned_, i);
+                const bool parked = v.parked_pos.load(std::memory_order_seq_cst) != v.parked_limit.load(std::memory_order_seq_cst);
+                const bool items = v.head.load(std::memory_order_seq_cst) != v.claim.load(std::memory_order_seq_cst);
+                if (!v.consumer_owned.load(std::memory_order_seq_cst) &&
+                    (parked || items || v.producer_owned.load(std::memory_order_seq_cst))) {
+                    channel::mark(ch.abandoned_, i);
+                }
+            }
+        }
+        return false;
+    }
+
     // Swap our (empty) ring for one that has no consumer.
     bool migrate() noexcept {
         channel& ch = *owner_;
@@ -872,23 +967,24 @@ private:
         MPMC_CHANNEL_STAT(refills);
 
         // Items sitting in a ring nobody pops from must not wait until we run
-        // dry, which may be never: look at one other ring every few refills
-        // and take what it holds if it has no consumer.  The same visit evens
-        // out our supply with another consumer's (balance_threshold).
-        if ((++refills_ & 3) == 0 && ch.nrings_ > 1) {
-            if (++patrol_ >= ch.nrings_) patrol_ = 0;
-            ring& v = ch.rings_[patrol_];
-            bool contended = false;
-            if (&v != ring_) {
-                if (!v.consumer_owned.load(std::memory_order_relaxed)) {
-                    if (steal_from(v, 1, contended)) {
-                        MPMC_CHANNEL_STAT(steals_patrol);
-                        return true;
-                    }
-                } else if (ch.opts_.balance_threshold != 0) {
-                    // another consumer's ring: take a batch if it is clearly better off than ours
+        // dry, which may be never: fetch a batch of them before anything else.
+        if (ch.nrings_ > 1 && collect_abandoned()) {
+            MPMC_CHANNEL_STAT(steals_patrol);
+            return true;
+        }
+
+        // Every few refills, compare our supply with another consumer's and
+        // take a batch if that one is clearly better off (balance_threshold).
+        if (ch.opts_.balance_threshold != 0 && (++refills_ & 3) == 0 && ch.nrings_ > 1) {
+            const std::size_t next = ch.next_marked(ch.attended_, patrol_);
+            if (next != ch.nrings_) {
+                patrol_ = next;
+                ring& v = ch.rings_[next];
+                if (&v != ring_) {
                     const std::size_t mine = ring_->head.load(std::memory_order_relaxed) - own_limit_;
-                    if (steal_from(v, mine + ch.opts_.balance_threshold, contended)) {
+                    bool contended = false;
+                    if (v.supply.load(std::memory_order_relaxed) > mine + ch.opts_.balance_threshold &&
+                        steal_from(v, mine + ch.opts_.balance_threshold, contended)) {
                         MPMC_CHANNEL_STAT(steals_balance);
                         return true;
                     }
